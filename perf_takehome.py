@@ -140,7 +140,7 @@ class KernelBuilder:
     def build_kernel(
     self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        UNROLL = 4  # step-4a: ILP unrolling only
+        
 
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
@@ -170,74 +170,63 @@ class KernelBuilder:
 
         body = []
 
-        # Per-lane temporaries (this is CRITICAL)
-        tmp_idx = []
-        tmp_val = []
-        tmp_node = []
-        tmp_addr = []
+        # Vector scratch registers (VLEN-width for SIMD loads/stores)
+        tmp_idx_v = self.alloc_scratch("tmp_idx_v", VLEN)
+        tmp_val_v = self.alloc_scratch("tmp_val_v", VLEN)
+        tmp_node_v = self.alloc_scratch("tmp_node_v", VLEN)
+        tmp_addr_v = self.alloc_scratch("tmp_addr_v", VLEN)
 
-        for u in range(UNROLL):
-            tmp_idx.append(self.alloc_scratch(f"tmp_idx_{u}"))
-            tmp_val.append(self.alloc_scratch(f"tmp_val_{u}"))
-            tmp_node.append(self.alloc_scratch(f"tmp_node_{u}"))
-            tmp_addr.append(self.alloc_scratch(f"tmp_addr_{u}"))
-
-        idx_global = self.alloc_scratch("idx_global")
+        # Helper registers for per-lane compute
+        tmp1_v = self.alloc_scratch("tmp1_v", VLEN)
+        tmp_node_addr = self.alloc_scratch("tmp_node_addr")
 
         for r in range(rounds):
-            for i in range(0, batch_size, UNROLL):
-                base_i = self.scratch_const(i)
+            for i in range(0, batch_size, VLEN):
+                i_const = self.scratch_const(i)
 
-                # ---- LOAD PHASE ----
-                for u in range(UNROLL):
-                    idx = i + u
+                # ---- LOAD PHASE (VECTORIZED) ----
+                # Load VLEN indices at once
+                body.append(("alu", ("+", tmp_addr_v, self.scratch["inp_indices_p"], i_const)))
+                body.append(("load", ("vload", tmp_idx_v, tmp_addr_v)))
+
+                # Load VLEN values at once
+                body.append(("alu", ("+", tmp_addr_v, self.scratch["inp_values_p"], i_const)))
+                body.append(("load", ("vload", tmp_val_v, tmp_addr_v)))
+
+                # ---- COMPUTE PHASE (PER LANE) ----
+                # Process each lane with scalar operations on indexed elements
+                for k in range(VLEN):
+                    idx = i + k
                     if idx >= batch_size:
                         continue
 
-                    u_const = self.scratch_const(u)
-                    body.append(("alu", ("+", idx_global, base_i, u_const)))
+                    # Gather tree node value for this lane
+                    body.append(("alu", ("+", tmp_node_addr, self.scratch["forest_values_p"], tmp_idx_v + k)))
+                    body.append(("load", ("load", tmp_node_v + k, tmp_node_addr)))
 
-                    body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_indices_p"], idx_global)))
-                    body.append(("load", ("load", tmp_idx[u], tmp_addr[u])))
+                    # XOR with node value
+                    body.append(("alu", ("^", tmp_val_v + k, tmp_val_v + k, tmp_node_v + k)))
+                    body.extend(self.build_hash(tmp_val_v + k, tmp1, tmp2, r, idx))
 
-                    body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_values_p"], idx_global)))
-                    body.append(("load", ("load", tmp_val[u], tmp_addr[u])))
-
-                # ---- COMPUTE PHASE ----
-                for u in range(UNROLL):
-                    idx = i + u
-                    if idx >= batch_size:
-                        continue
-
-                    body.append(("alu", ("+", tmp_addr[u], self.scratch["forest_values_p"], tmp_idx[u])))
-                    body.append(("load", ("load", tmp_node[u], tmp_addr[u])))
-
-                    body.append(("alu", ("^", tmp_val[u], tmp_val[u], tmp_node[u])))
-                    body.extend(self.build_hash(tmp_val[u], tmp1, tmp2, r, idx))
-
-                    body.append(("alu", ("%", tmp1, tmp_val[u], two)))
+                    # Branch logic (modulo select)
+                    body.append(("alu", ("%", tmp1, tmp_val_v + k, two)))
                     body.append(("alu", ("==", tmp1, tmp1, zero)))
                     body.append(("flow", ("select", tmp3, tmp1, one, two)))
-                    body.append(("alu", ("*", tmp_idx[u], tmp_idx[u], two)))
-                    body.append(("alu", ("+", tmp_idx[u], tmp_idx[u], tmp3)))
+                    body.append(("alu", ("*", tmp_idx_v + k, tmp_idx_v + k, two)))
+                    body.append(("alu", ("+", tmp_idx_v + k, tmp_idx_v + k, tmp3)))
 
-                    body.append(("alu", ("<", tmp1, tmp_idx[u], self.scratch["n_nodes"])))
-                    body.append(("flow", ("select", tmp_idx[u], tmp1, tmp_idx[u], zero)))
+                    # Bounds check
+                    body.append(("alu", ("<", tmp1, tmp_idx_v + k, self.scratch["n_nodes"])))
+                    body.append(("flow", ("select", tmp_idx_v + k, tmp1, tmp_idx_v + k, zero)))
 
-                # ---- STORE PHASE ----
-                for u in range(UNROLL):
-                    idx = i + u
-                    if idx >= batch_size:
-                        continue
+                # ---- STORE PHASE (VECTORIZED) ----
+                # Store VLEN indices at once
+                body.append(("alu", ("+", tmp_addr_v, self.scratch["inp_indices_p"], i_const)))
+                body.append(("store", ("vstore", tmp_addr_v, tmp_idx_v)))
 
-                    u_const = self.scratch_const(u)
-                    body.append(("alu", ("+", idx_global, base_i, u_const)))
-
-                    body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_indices_p"], idx_global)))
-                    body.append(("store", ("store", tmp_addr[u], tmp_idx[u])))
-
-                    body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_values_p"], idx_global)))
-                    body.append(("store", ("store", tmp_addr[u], tmp_val[u])))
+                # Store VLEN values at once
+                body.append(("alu", ("+", tmp_addr_v, self.scratch["inp_values_p"], i_const)))
+                body.append(("store", ("vstore", tmp_addr_v, tmp_val_v)))
 
         self.instrs.extend(self.build(body))
         self.instrs.append({"flow": [("pause",)]})
