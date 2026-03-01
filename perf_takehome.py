@@ -57,21 +57,29 @@ class KernelBuilder:
         instrs = []
 
         current_alu_bundle = []
+        current_valu_bundle = []
         writes_in_cycle = set()
 
         def flush_alu():
-            nonlocal current_alu_bundle, writes_in_cycle
+            nonlocal current_alu_bundle, current_valu_bundle, writes_in_cycle
             if current_alu_bundle:
                 instrs.append({"alu": current_alu_bundle})
+            if current_valu_bundle:
+                instrs.append({"valu": current_valu_bundle})
             current_alu_bundle = []
+            current_valu_bundle = []
             writes_in_cycle = set()
 
         for engine, slot in slots:
             if engine == "alu":
                 _, dest, src1, src2 = slot
 
-            # RAW or WAW hazard → must flush
-                if src1 in writes_in_cycle or src2 in writes_in_cycle or dest in writes_in_cycle:
+                #WAW
+                if dest in writes_in_cycle:
+                    flush_alu()
+
+                #RAW
+                if src1 in writes_in_cycle or src2 in writes_in_cycle:
                     flush_alu()
 
                 current_alu_bundle.append(slot)
@@ -79,6 +87,24 @@ class KernelBuilder:
 
             # Slot limit
                 if len(current_alu_bundle) == SLOT_LIMITS["alu"]:
+                    flush_alu()
+
+            elif engine == "valu":
+                _, dest, src1, src2 = slot
+
+                #WAW
+                if dest in writes_in_cycle:
+                    flush_alu()
+
+                #RAW
+                if src1 in writes_in_cycle or src2 in writes_in_cycle:
+                    flush_alu()
+
+                current_valu_bundle.append(slot)
+                writes_in_cycle.add(dest)
+
+            # Slot limit
+                if len(current_valu_bundle) == SLOT_LIMITS["valu"]:
                     flush_alu()
 
             elif engine == "load":
@@ -184,7 +210,7 @@ class KernelBuilder:
             for i in range(0, batch_size, VLEN):
                 i_const = self.scratch_const(i)
 
-                # ---- LOAD PHASE (VECTORIZED) ----
+                
                 # Load VLEN indices at once
                 body.append(("alu", ("+", tmp_addr_v, self.scratch["inp_indices_p"], i_const)))
                 body.append(("load", ("vload", tmp_idx_v, tmp_addr_v)))
@@ -193,16 +219,20 @@ class KernelBuilder:
                 body.append(("alu", ("+", tmp_addr_v, self.scratch["inp_values_p"], i_const)))
                 body.append(("load", ("vload", tmp_val_v, tmp_addr_v)))
 
-                # ---- COMPUTE PHASE (PER LANE) ----
-                # Process each lane with scalar operations on indexed elements
+                # Load all tree node values (scatter load per lane)
                 for k in range(VLEN):
                     idx = i + k
                     if idx >= batch_size:
                         continue
 
-                    # Gather tree node value for this lane
                     body.append(("alu", ("+", tmp_node_addr, self.scratch["forest_values_p"], tmp_idx_v + k)))
                     body.append(("load", ("load", tmp_node_v + k, tmp_node_addr)))
+
+                
+                for k in range(VLEN):
+                    idx = i + k
+                    if idx >= batch_size:
+                        continue
 
                     # XOR with node value
                     body.append(("alu", ("^", tmp_val_v + k, tmp_val_v + k, tmp_node_v + k)))
@@ -219,7 +249,7 @@ class KernelBuilder:
                     body.append(("alu", ("<", tmp1, tmp_idx_v + k, self.scratch["n_nodes"])))
                     body.append(("flow", ("select", tmp_idx_v + k, tmp1, tmp_idx_v + k, zero)))
 
-                # ---- STORE PHASE (VECTORIZED) ----
+                
                 # Store VLEN indices at once
                 body.append(("alu", ("+", tmp_addr_v, self.scratch["inp_indices_p"], i_const)))
                 body.append(("store", ("vstore", tmp_addr_v, tmp_idx_v)))
