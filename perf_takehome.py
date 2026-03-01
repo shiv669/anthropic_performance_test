@@ -48,11 +48,45 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
+    def build(self, slots, vliw=False):
+        """
+        - Pack ALU ops only when there are NO RAW/WAW hazards
+        - Writes become visible only after cycle ends
+        """
+
         instrs = []
+
+        current_alu_bundle = []
+        writes_in_cycle = set()
+
+        def flush_alu():
+            nonlocal current_alu_bundle, writes_in_cycle
+            if current_alu_bundle:
+                instrs.append({"alu": current_alu_bundle})
+            current_alu_bundle = []
+            writes_in_cycle = set()
+
         for engine, slot in slots:
-            instrs.append({engine: [slot]})
+            if engine == "alu":
+                _, dest, src1, src2 = slot
+
+            # RAW or WAW hazard → must flush
+                if src1 in writes_in_cycle or src2 in writes_in_cycle or dest in writes_in_cycle:
+                    flush_alu()
+
+                current_alu_bundle.append(slot)
+                writes_in_cycle.add(dest)
+
+            # Slot limit
+                if len(current_alu_bundle) == SLOT_LIMITS["alu"]:
+                    flush_alu()
+
+            else:
+            # Non-ALU ops are barriers
+                flush_alu()
+                instrs.append({engine: [slot]})
+
+        flush_alu()
         return instrs
 
     def add(self, engine, slot):
