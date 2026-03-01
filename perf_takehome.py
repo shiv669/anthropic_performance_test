@@ -81,10 +81,28 @@ class KernelBuilder:
                 if len(current_alu_bundle) == SLOT_LIMITS["alu"]:
                     flush_alu()
 
+            elif engine == "load":
+                #finish an alu bundle before load
+                flush_alu()
+
+                #emit load as its own cycle
+                instrs.append({"load": [slot]})
+
+                #reset dependency tracking
+                writes_in_cycle = set()
+
+                #record that this cycle writes to dest
+                if slot[0] in ("load","const"):
+                    dest = slot[1]
+                    writes_in_cycle.add(dest)
+
+                
+                
             else:
             # Non-ALU ops are barriers
                 flush_alu()
                 instrs.append({engine: [slot]})
+                writes_in_cycle = set()
 
         flush_alu()
         return instrs
