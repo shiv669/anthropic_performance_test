@@ -221,3 +221,179 @@ Optimization is simply:
 > moving work around so fewer boxes are empty.
 
 ---
+
+# How DAG Scheduling Actually Works in This VLIW + SIMD CPU
+
+This section explains **how dependency graphs (DAGs)** actually exist inside this code  
+and how the simulator CPU executes them **cycle by cycle**.
+
+This is the key to understanding performance optimization here.
+
+---
+
+## First: what part are we analyzing?
+
+We pick **one batch element in one round** from the reference kernel:
+
+```python
+idx = mem[inp_indices_p + i]
+val = mem[inp_values_p + i]
+node_val = mem[forest_values_p + idx]
+val = myhash(val ^ node_val)
+idx = 2 * idx + (1 if val % 2 == 0 else 2)
+idx = 0 if idx >= n_nodes else idx
+mem[inp_values_p + i] = val
+mem[inp_indices_p + i] = idx
+```
+
+This is the inner loop. Everything else is just setup.
+
+---
+
+## Step 1: list the operations (not instructions)
+
+Forget Python. Think in operations:
+
+1. **Load idx**
+2. **Load val**
+3. **Load node_val**
+4. **XOR val ^ node_val**
+5. **Hash stage 0**
+6. **Hash stage 1**
+7. **Hash stage 2**
+8. **Hash stage 3**
+9. **Hash stage 4**
+10. **Hash stage 5**
+11. **Compute val % 2**
+12. **Compute next idx**
+13. **Bounds check**
+14. **Store val**
+15. **Store idx**
+
+These are the nodes of the DAG.
+
+---
+
+## Step 2: draw the dependency graph (DAG)
+
+Here is the real dependency structure:
+
+
+
+```text
+Load idx ───────┐
+                ├─> Load node_val ─┐
+Load val ───────┘                  ├─> XOR ─> Hash0 ─> Hash1 ─> Hash2 ─> Hash3 ─> Hash4 ─> Hash5 ─┐
+                                                                                                     ├─> val % 2 ─> select ─┐
+                                                                                                     │                      ├─> next idx ─> bounds check ─┐
+                                                                                                     │                                               ├─> store idx
+                                                                                                     └───────────────────────────────────────────────┘
+                                                                                                     └───────────────────────────────────────────────> store val
+```
+
+**Key points:**
+
+* Loads must happen before compute
+* Hash stages are strictly sequential
+* Stores must happen last
+* You cannot reorder across arrows
+
+This graph is fixed by logic. Optimization is only about when nodes execute, not changing edges.
+
+---
+
+## Step 3: understand how the CPU executes the DAG
+
+Important CPU rule:
+
+> All reads happen at the start of a cycle  
+> All writes commit at the end of a cycle
+
+So:
+
+* You cannot use a value in the same cycle it is produced
+* Dependencies force cycle boundaries
+
+---
+
+## Step 4: naive (baseline) scheduling
+
+The baseline kernel does this:
+
+* **Cycle 1:** load idx
+* **Cycle 2:** load val
+* **Cycle 3:** load node_val
+* **Cycle 4:** xor
+* **Cycle 5:** hash stage 0
+* **Cycle 6:** hash stage 1
+* ...
+* **Cycle 11:** hash stage 5
+* **Cycle 12:** mod
+* **Cycle 13:** select
+* **Cycle 14:** compute idx
+* **Cycle 15:** bounds check
+* **Cycle 16:** store val
+* **Cycle 17:** store idx
+
+This is correct but terrible. Why? One operation per cycle, most VLIW slots are empty, no overlap, and no SIMD.
+
+---
+
+## Step 5: where the DAG helps optimization
+
+The DAG tells us:
+
+**These can run together:**
+* load idx and load val (independent)
+* store idx and store val (independent)
+* address arithmetic and loads (if inputs ready)
+
+**These cannot:**
+* hash stages (strict chain)
+* anything that depends on val before hash finishes
+
+So an optimized schedule looks more like:
+
+* **Cycle 1:** load idx, load val
+* **Cycle 2:** load node_val, compute address math
+* **Cycle 3:** xor, hash stage 0
+* **Cycle 4:** hash stage 1, hash stage 2
+* **Cycle 5:** hash stage 3, hash stage 4
+* **Cycle 6:** hash stage 5, val % 2
+* **Cycle 7:** select, compute next idx
+* **Cycle 8:** bounds check, store val, store idx
+
+Same DAG. Same result. **Half the cycles.**
+
+---
+
+## Step 6: where SIMD fits in the DAG
+
+SIMD does not change the DAG. It changes how many copies of the DAG run together.
+
+Instead of:
+* DAG for element 0
+* DAG for element 1
+* DAG for element 2
+
+SIMD executes:
+* **DAG for elements [0..7] together**
+
+Same arrows. Same dependencies. Just wider.
+
+---
+
+## Final mental model (this is the key)
+
+1. The algorithm defines a **DAG**
+2. The DAG defines **what must happen before what**
+3. The CPU defines **how much can happen per cycle**
+
+**Optimization is:** executing all ready DAG nodes per cycle without violating dependencies.
+
+---
+
+## One sentence to lock it in
+
+> This code is optimized by scheduling a fixed dependency DAG onto a VLIW CPU so that all independent nodes execute as early as possible within per-cycle hardware limits.
+
