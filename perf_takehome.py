@@ -138,16 +138,14 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+    self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        """
-        Like reference_kernel2 but building actual instructions.
-        Scalar implementation using only scalar ALU and load/store.
-        """
+        UNROLL = 4  # step-4a: ILP unrolling only
+
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
         tmp3 = self.alloc_scratch("tmp3")
-        # Scratch space addresses
+
         init_vars = [
             "rounds",
             "n_nodes",
@@ -159,75 +157,89 @@ class KernelBuilder:
         ]
         for v in init_vars:
             self.alloc_scratch(v, 1)
+
         for i, v in enumerate(init_vars):
             self.add("load", ("const", tmp1, i))
             self.add("load", ("load", self.scratch[v], tmp1))
 
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        zero = self.scratch_const(0)
+        one = self.scratch_const(1)
+        two = self.scratch_const(2)
 
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
         self.add("flow", ("pause",))
-        # Any debug engine instruction is ignored by the submission simulator
-        self.add("debug", ("comment", "Starting loop"))
 
-        body = []  # array of slots
+        body = []
 
-        # Scalar scratch registers
-        tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
-        tmp_node_val = self.alloc_scratch("tmp_node_val")
-        tmp_addr = self.alloc_scratch("tmp_addr")
+        # Per-lane temporaries (this is CRITICAL)
+        tmp_idx = []
+        tmp_val = []
+        tmp_node = []
+        tmp_addr = []
+
+        for u in range(UNROLL):
+            tmp_idx.append(self.alloc_scratch(f"tmp_idx_{u}"))
+            tmp_val.append(self.alloc_scratch(f"tmp_val_{u}"))
+            tmp_node.append(self.alloc_scratch(f"tmp_node_{u}"))
+            tmp_addr.append(self.alloc_scratch(f"tmp_addr_{u}"))
 
         idx_global = self.alloc_scratch("idx_global")
 
-        for round in range(rounds):
-            for i in range(0, batch_size, VLEN):
-                base_i_const = self.scratch_const(i)
-                for k in range(VLEN):
-                    k_const = self.scratch_const(k)
-                    body.append(("alu", ("+", idx_global, base_i_const, k_const)))
-                    # idx = mem[inp_indices_p + i]
-                    body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], idx_global)))
-                    body.append(("load", ("load", tmp_idx, tmp_addr)))
-                    # body.append(("debug", ("compare", tmp_idx, (round, i, "idx"))))
-                    # val = mem[inp_values_p + i]
-                    body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], idx_global)))
-                    body.append(("load", ("load", tmp_val, tmp_addr)))
-                    # body.append(("debug", ("compare", tmp_val, (round, i, "val"))))
-                    # node_val = mem[forest_values_p + idx]
-                    body.append(("alu", ("+", tmp_addr, self.scratch["forest_values_p"], tmp_idx)))
-                    body.append(("load", ("load", tmp_node_val, tmp_addr)))
-                    # body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
-                    # val = myhash(val ^ node_val)
-                    body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                    body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i + k))
-                    # body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
-                    # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                    body.append(("alu", ("%", tmp1, tmp_val, two_const)))
-                    body.append(("alu", ("==", tmp1, tmp1, zero_const)))
-                    body.append(("flow", ("select", tmp3, tmp1, one_const, two_const)))
-                    body.append(("alu", ("*", tmp_idx, tmp_idx, two_const)))
-                    body.append(("alu", ("+", tmp_idx, tmp_idx, tmp3)))
-                    # body.append(("debug", ("compare", tmp_idx, (round, i, "next_idx"))))
-                    # idx = 0 if idx >= n_nodes else idx
-                    body.append(("alu", ("<", tmp1, tmp_idx, self.scratch["n_nodes"])))
-                    body.append(("flow", ("select", tmp_idx, tmp1, tmp_idx, zero_const)))
-                    # body.append(("debug", ("compare", tmp_idx, (round, i, "wrapped_idx"))))
-                    # mem[inp_indices_p + i] = idx
-                    body.append(("alu", ("+", tmp_addr, self.scratch["inp_indices_p"], idx_global)))
-                    body.append(("store", ("store", tmp_addr, tmp_idx)))
-                    # mem[inp_values_p + i] = val
-                    body.append(("alu", ("+", tmp_addr, self.scratch["inp_values_p"], idx_global)))
-                    body.append(("store", ("store", tmp_addr, tmp_val)))
+        for r in range(rounds):
+            for i in range(0, batch_size, UNROLL):
+                base_i = self.scratch_const(i)
 
-        body_instrs = self.build(body)
-        self.instrs.extend(body_instrs)
-        # Required to match with the yield in reference_kernel2
+                # ---- LOAD PHASE ----
+                for u in range(UNROLL):
+                    idx = i + u
+                    if idx >= batch_size:
+                        continue
+
+                    u_const = self.scratch_const(u)
+                    body.append(("alu", ("+", idx_global, base_i, u_const)))
+
+                    body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_indices_p"], idx_global)))
+                    body.append(("load", ("load", tmp_idx[u], tmp_addr[u])))
+
+                    body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_values_p"], idx_global)))
+                    body.append(("load", ("load", tmp_val[u], tmp_addr[u])))
+
+                # ---- COMPUTE PHASE ----
+                for u in range(UNROLL):
+                    idx = i + u
+                    if idx >= batch_size:
+                        continue
+
+                    body.append(("alu", ("+", tmp_addr[u], self.scratch["forest_values_p"], tmp_idx[u])))
+                    body.append(("load", ("load", tmp_node[u], tmp_addr[u])))
+
+                    body.append(("alu", ("^", tmp_val[u], tmp_val[u], tmp_node[u])))
+                    body.extend(self.build_hash(tmp_val[u], tmp1, tmp2, r, idx))
+
+                    body.append(("alu", ("%", tmp1, tmp_val[u], two)))
+                    body.append(("alu", ("==", tmp1, tmp1, zero)))
+                    body.append(("flow", ("select", tmp3, tmp1, one, two)))
+                    body.append(("alu", ("*", tmp_idx[u], tmp_idx[u], two)))
+                    body.append(("alu", ("+", tmp_idx[u], tmp_idx[u], tmp3)))
+
+                    body.append(("alu", ("<", tmp1, tmp_idx[u], self.scratch["n_nodes"])))
+                    body.append(("flow", ("select", tmp_idx[u], tmp1, tmp_idx[u], zero)))
+
+                # ---- STORE PHASE ----
+                for u in range(UNROLL):
+                    idx = i + u
+                    if idx >= batch_size:
+                        continue
+
+                    u_const = self.scratch_const(u)
+                    body.append(("alu", ("+", idx_global, base_i, u_const)))
+
+                    body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_indices_p"], idx_global)))
+                    body.append(("store", ("store", tmp_addr[u], tmp_idx[u])))
+
+                    body.append(("alu", ("+", tmp_addr[u], self.scratch["inp_values_p"], idx_global)))
+                    body.append(("store", ("store", tmp_addr[u], tmp_val[u])))
+
+        self.instrs.extend(self.build(body))
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
