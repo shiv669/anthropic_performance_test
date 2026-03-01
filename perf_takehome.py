@@ -57,29 +57,21 @@ class KernelBuilder:
         instrs = []
 
         current_alu_bundle = []
-        current_valu_bundle = []
         writes_in_cycle = set()
 
         def flush_alu():
-            nonlocal current_alu_bundle, current_valu_bundle, writes_in_cycle
+            nonlocal current_alu_bundle, writes_in_cycle
             if current_alu_bundle:
                 instrs.append({"alu": current_alu_bundle})
-            if current_valu_bundle:
-                instrs.append({"valu": current_valu_bundle})
             current_alu_bundle = []
-            current_valu_bundle = []
             writes_in_cycle = set()
 
         for engine, slot in slots:
             if engine == "alu":
                 _, dest, src1, src2 = slot
 
-                #WAW
-                if dest in writes_in_cycle:
-                    flush_alu()
-
-                #RAW
-                if src1 in writes_in_cycle or src2 in writes_in_cycle:
+            # RAW or WAW hazard → must flush
+                if src1 in writes_in_cycle or src2 in writes_in_cycle or dest in writes_in_cycle:
                     flush_alu()
 
                 current_alu_bundle.append(slot)
@@ -87,24 +79,6 @@ class KernelBuilder:
 
             # Slot limit
                 if len(current_alu_bundle) == SLOT_LIMITS["alu"]:
-                    flush_alu()
-
-            elif engine == "valu":
-                _, dest, src1, src2 = slot
-
-                #WAW
-                if dest in writes_in_cycle:
-                    flush_alu()
-
-                #RAW
-                if src1 in writes_in_cycle or src2 in writes_in_cycle:
-                    flush_alu()
-
-                current_valu_bundle.append(slot)
-                writes_in_cycle.add(dest)
-
-            # Slot limit
-                if len(current_valu_bundle) == SLOT_LIMITS["valu"]:
                     flush_alu()
 
             elif engine == "load":
@@ -156,10 +130,18 @@ class KernelBuilder:
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            # Original order created: val → tmp1 → val, val → tmp2 → val dependency paths
+            # New order: start tmp1 first, then compute tmp2 and final op2 can execute
+            # as soon as both tmp1 and tmp2 are ready (not sequentially waiting)
+            
+            # First: compute tmp1 from current val
             slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+            
+            # Second: compute tmp2 from current val (can start while tmp1 is in flight)
             slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+            
+            # Third: combine both into new val (now tmp1 and tmp2 are ready)
             slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
-            # debug removed for performance
 
         return slots
 
@@ -168,9 +150,10 @@ class KernelBuilder:
     ):
         
 
-        tmp1 = self.alloc_scratch("tmp1")
-        tmp2 = self.alloc_scratch("tmp2")
-        tmp3 = self.alloc_scratch("tmp3")
+        # Scalar temporaries for initialization only
+        tmp1_scalar = self.alloc_scratch("tmp1_scalar")
+        tmp2_scalar = self.alloc_scratch("tmp2_scalar")
+        tmp3_scalar = self.alloc_scratch("tmp3_scalar")
 
         init_vars = [
             "rounds",
@@ -185,8 +168,8 @@ class KernelBuilder:
             self.alloc_scratch(v, 1)
 
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.add("load", ("const", tmp1_scalar, i))
+            self.add("load", ("load", self.scratch[v], tmp1_scalar))
 
         zero = self.scratch_const(0)
         one = self.scratch_const(1)
@@ -202,8 +185,12 @@ class KernelBuilder:
         tmp_node_v = self.alloc_scratch("tmp_node_v", VLEN)
         tmp_addr_v = self.alloc_scratch("tmp_addr_v", VLEN)
 
-        # Helper registers for per-lane compute
+        # Per-lane temporaries for hash computation (reduces WAW hazards)
         tmp1_v = self.alloc_scratch("tmp1_v", VLEN)
+        tmp2_v = self.alloc_scratch("tmp2_v", VLEN)
+        tmp3_v = self.alloc_scratch("tmp3_v", VLEN)
+
+        # Helper register for node address computation
         tmp_node_addr = self.alloc_scratch("tmp_node_addr")
 
         for r in range(rounds):
@@ -229,25 +216,47 @@ class KernelBuilder:
                     body.append(("load", ("load", tmp_node_v + k, tmp_node_addr)))
 
                 
+                # ========== PHASE 2: COMPUTE ALL (STEP 6: SOFTWARE PIPELINING) ==========
+                # Key insight: Interleave hash stages across lanes
+                # While lane 0 finishes stage 1, lanes 1-7 compute their stage 1
+                # This hides ALU latency and keeps all lanes in flight
+                
+                # Step 1: XOR with node value for all lanes
+                for k in range(VLEN):
+                    idx = i + k
+                    if idx >= batch_size:
+                        continue
+                    body.append(("alu", ("^", tmp_val_v + k, tmp_val_v + k, tmp_node_v + k)))
+                
+                # Step 2: Hash computation - build stages across lanes for software pipelining
+                for stage_idx, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    # For each hash stage, process all lanes before moving to next stage
+                    # This interleaves the stages across lanes, hiding latency
+                    for k in range(VLEN):
+                        idx = i + k
+                        if idx >= batch_size:
+                            continue
+                        # Replicate build_hash inline per-stage for interleaving
+                        body.append(("alu", (op1, tmp1_v + k, tmp_val_v + k, self.scratch_const(val1))))
+                        body.append(("alu", (op3, tmp2_v + k, tmp_val_v + k, self.scratch_const(val3))))
+                        body.append(("alu", (op2, tmp_val_v + k, tmp1_v + k, tmp2_v + k)))
+                
+                # Step 3: Branch logic for all lanes
                 for k in range(VLEN):
                     idx = i + k
                     if idx >= batch_size:
                         continue
 
-                    # XOR with node value
-                    body.append(("alu", ("^", tmp_val_v + k, tmp_val_v + k, tmp_node_v + k)))
-                    body.extend(self.build_hash(tmp_val_v + k, tmp1, tmp2, r, idx))
-
                     # Branch logic (modulo select)
-                    body.append(("alu", ("%", tmp1, tmp_val_v + k, two)))
-                    body.append(("alu", ("==", tmp1, tmp1, zero)))
-                    body.append(("flow", ("select", tmp3, tmp1, one, two)))
+                    body.append(("alu", ("%", tmp1_v + k, tmp_val_v + k, two)))
+                    body.append(("alu", ("==", tmp1_v + k, tmp1_v + k, zero)))
+                    body.append(("flow", ("select", tmp3_v + k, tmp1_v + k, one, two)))
                     body.append(("alu", ("*", tmp_idx_v + k, tmp_idx_v + k, two)))
-                    body.append(("alu", ("+", tmp_idx_v + k, tmp_idx_v + k, tmp3)))
+                    body.append(("alu", ("+", tmp_idx_v + k, tmp_idx_v + k, tmp3_v + k)))
 
                     # Bounds check
-                    body.append(("alu", ("<", tmp1, tmp_idx_v + k, self.scratch["n_nodes"])))
-                    body.append(("flow", ("select", tmp_idx_v + k, tmp1, tmp_idx_v + k, zero)))
+                    body.append(("alu", ("<", tmp1_v + k, tmp_idx_v + k, self.scratch["n_nodes"])))
+                    body.append(("flow", ("select", tmp_idx_v + k, tmp1_v + k, tmp_idx_v + k, zero)))
 
                 
                 # Store VLEN indices at once
